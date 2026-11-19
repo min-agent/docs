@@ -4,6 +4,9 @@
 # StatiCrypt. StatiCrypt can only encrypt HTML, so the markdown index is
 # published as docs/index.html rather than docs/index.md.
 #
+# Every run is a full rebuild: all tags are cloned again from scratch and every
+# page is re-encrypted. The workflow takes no parameters.
+#
 # Required repository configuration
 #   Secrets
 #     DOCS_BOT_TOKEN        Fine-grained PAT or GitHub App token that can read
@@ -17,17 +20,15 @@
 #                           .github/docs-sync-state.json.
 #
 # Triggers
-#   repository_dispatch (type: code-repo-release, payload: {tag: "<tag>"}),
-#   sent by the code repo with:
-#     gh api repos/min-agent/DOCS_REPO/dispatches \
-#       -f event_type=code-repo-release -f client_payload[tag]="$TAG"
-#   A daily schedule re-scans the code repo so a missed dispatch is caught up.
+#   repository_dispatch (type: code-repo-release) from the code repo, a daily
+#   schedule, and manual runs from the Actions tab. Payloads are ignored.
+#   A tag is fetched from:
+#     https://github.com/min-agent/Min.git
 #
 # Password handling
 #   This workflow only reads STATICRYPT_PASSWORD. If the secret is missing or
 #   too short, it fails with an instruction to set it manually. After changing
-#   the secret, run this workflow manually with rebuild_all set to true so every
-#   page is re-encrypted with the new password.
+#   the secret, run this workflow again; every run re-encrypts all pages.
 
 name: Sync encrypted docs from tagged releases
 
@@ -35,16 +36,6 @@ on:
   repository_dispatch:
     types: [code-repo-release]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Single tag to sync. Leave empty to sync every tag that is not published yet."
-        required: false
-        type: string
-      rebuild_all:
-        description: "Re-import and re-encrypt every tag."
-        required: false
-        type: boolean
-        default: false
   schedule:
     - cron: "41 3 * * *"
 
@@ -65,10 +56,6 @@ jobs:
       SYNC_TOKEN: ${{ secrets.DOCS_BOT_TOKEN }}
       STATICRYPT_PASSWORD: ${{ secrets.STATICRYPT_PASSWORD }}
       STATICRYPT_SALT: ${{ vars.STATICRYPT_SALT }}
-      TARGET_TAG: ${{ github.event.client_payload.tag || inputs.tag || '' }}
-      REBUILD_ALL: ${{ inputs.rebuild_all || 'false' }}
-      STAGE_DIR: ${{ runner.temp }}/staticrypt-stage
-      PANDOC_DIR: ${{ runner.temp }}/pandoc-tools
       PANDOC_VERSION: "3.14"
       PANDOC_SHA256: "c5f4720cdefb3f7bdc5d07202ef579feef0d1370773c873804dd8fdaa8c4f1b8"
       STATICRYPT_VERSION: "3.5.4"
@@ -85,7 +72,7 @@ jobs:
             echo "::error::STATICRYPT_PASSWORD is not set. Add it under Settings > Secrets and variables > Actions in this repository, with a value of at least 14 characters."
             missing=1
           elif [ "${#STATICRYPT_PASSWORD}" -lt 14 ]; then
-            echo "::error::STATICRYPT_PASSWORD is shorter than 14 characters. Update the repository secret, then run this workflow manually with rebuild_all set to true."
+            echo "::error::STATICRYPT_PASSWORD is shorter than 14 characters. Update the repository secret and run this workflow again."
             missing=1
           fi
           exit "$missing"
@@ -107,11 +94,13 @@ jobs:
         with:
           path: |
             ~/.npm
-            ${{ env.PANDOC_DIR }}
+            ${{ runner.temp }}/pandoc-tools
           key: docs-tools-staticrypt-${{ env.STATICRYPT_VERSION }}-pandoc-${{ env.PANDOC_VERSION }}
           restore-keys: docs-tools-staticrypt-${{ env.STATICRYPT_VERSION }}-pandoc-
 
       - name: Install pinned pandoc
+        env:
+          PANDOC_DIR: ${{ runner.temp }}/pandoc-tools
         run: |
           set -euo pipefail
           mkdir -p "$PANDOC_DIR"
@@ -127,13 +116,13 @@ jobs:
           "$PANDOC_DIR/pandoc" --version | head -n 1
           echo "$PANDOC_DIR" >> "$GITHUB_PATH"
 
-      - name: Stage documentation from new tags
+      - name: Stage documentation from every tag
         id: stage
+        env:
+          STAGE_DIR: ${{ runner.temp }}/staticrypt-stage
         run: |
           python3 - <<'PY'
           import base64
-          import copy
-          import hashlib
           import json
           import os
           import re
@@ -155,8 +144,6 @@ jobs:
           docs_dir = workspace / "docs"
           state_path = workspace / ".github" / "docs-sync-state.json"
           stage = Path(os.environ["STAGE_DIR"]).resolve()
-          target_tag = (os.environ.get("TARGET_TAG") or "").strip()
-          rebuild_all = (os.environ.get("REBUILD_ALL") or "").strip().lower() == "true"
 
           # Pass git credentials through the environment, not argv, so the PAT
           # never appears in a process listing or a git trace.
@@ -173,7 +160,7 @@ jobs:
           docs_dir.mkdir(parents=True, exist_ok=True)
           (docs_dir / ".nojekyll").touch()
 
-          state = {"tags": {}, "index_hash": None, "salt": None}
+          state = {"salt": None}
           if state_path.exists():
               state.update(json.loads(state_path.read_text(encoding="utf-8")))
 
@@ -192,23 +179,17 @@ jobs:
 
           if not tags:
               note("The code repo has no tags.")
-          if target_tag and target_tag not in tags:
-              print(f"::error::Tag '{target_tag}' does not exist in {slug}.", file=sys.stderr)
-              sys.exit(1)
 
           def folder_for(tag):
               return re.sub(r"[^A-Za-z0-9._-]+", "-", tag).strip("-.")
 
-          imported, skipped, without_docs = [], [], []
+          imported, without_docs = [], []
           used_folders = set()
-          new_state = copy.deepcopy(state)  # keep entries for tags outside a targeted run
 
+          # No cache, no SHA check, no target tag: every tag is cloned and
+          # staged on every run.
           for tag in sorted(tags):
-              if target_tag and tag != target_tag:
-                  continue
-              sha = tags[tag]
-              previous = state["tags"].get(tag, {})
-              folder = previous.get("folder") or folder_for(tag)
+              folder = folder_for(tag)
               if not folder or folder in {".", ".."}:
                   print(f"::error::Tag '{tag}' cannot be turned into a directory name.", file=sys.stderr)
                   sys.exit(1)
@@ -219,36 +200,24 @@ jobs:
               used_folders.add(folder)
 
               destination = stage / folder
-              if (not rebuild_all
-                      and previous.get("sha") == sha
-                      and (previous.get("published") is False
-                           or (docs_dir / folder).is_dir())):
-                  skipped.append(tag)
-                  new_state["tags"][tag] = {"sha": sha, "folder": folder,
-                                            "published": previous.get("published", True)}
-                  continue
-
               checkout = Path(tempfile.mkdtemp())
               try:
                   run(["git", "clone", "--quiet", "--depth", "1", "--filter=blob:none",
                        "--sparse", "--branch", tag, remote, str(checkout)])
                   if "docs" not in run(["git", "-C", str(checkout), "ls-tree", "--name-only", "HEAD"]).split():
                       without_docs.append(tag)
-                      new_state["tags"][tag] = {"sha": sha, "folder": folder, "published": False}
                       continue
                   run(["git", "-C", str(checkout), "sparse-checkout", "set", "docs"])
                   source = checkout / "docs"
                   if not source.is_dir() or not any(p.is_file() for p in source.rglob("*")):
                       without_docs.append(tag)
-                      new_state["tags"][tag] = {"sha": sha, "folder": folder, "published": False}
                       continue
 
                   shutil.copytree(source, destination, ignore=shutil.ignore_patterns(".git"))
               finally:
                   shutil.rmtree(checkout, ignore_errors=True)
 
-              # A re-pushed tag is rebuilt from scratch so stale pages do not
-              # survive the update.
+              # Replacing the folder from scratch also removes stale pages.
               shutil.rmtree(docs_dir / folder, ignore_errors=True)
 
               # A directory link such as ./v1.2.0/ has to resolve to something.
@@ -262,7 +231,6 @@ jobs:
                   (destination / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
               imported.append(tag)
-              new_state["tags"][tag] = {"sha": sha, "folder": folder, "published": True}
 
           folders = sorted(
               {p.name for p in docs_dir.iterdir() if p.is_dir() and not p.name.startswith(".")}
@@ -276,29 +244,17 @@ jobs:
           index_lines = ["# Documentation", "",
                          "Encrypted documentation for each tagged release.", ""]
           index_lines += [f"- [{folder}](./{folder}/)" for folder in sorted(folders, key=version_key, reverse=True)]
-          index_source = "\n".join(index_lines) + "\n"
-          index_hash = hashlib.sha256(index_source.encode("utf-8")).hexdigest()
-
-          index_staged = (rebuild_all
-                          or state.get("index_hash") != index_hash
-                          or not (docs_dir / "index.html").exists())
-          if index_staged:
-              (stage / "index.md").write_text(index_source, encoding="utf-8")
-              new_state["index_hash"] = index_hash
+          (stage / "index.md").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
 
           salt = (os.environ.get("STATICRYPT_SALT") or "").strip() or state.get("salt") or secrets.token_hex(16)
-          new_state["salt"] = salt
-
           state_path.parent.mkdir(parents=True, exist_ok=True)
-          state_path.write_text(json.dumps(new_state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          state_path.write_text(json.dumps({"salt": salt}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
           if imported:
               note("Imported: " + ", ".join(imported))
-          if skipped:
-              note("Already published: " + ", ".join(skipped))
           if without_docs:
               note("No docs/ folder at: " + ", ".join(without_docs))
-          note("Index regenerated." if index_staged else "Index unchanged.")
+          note("Index regenerated.")
 
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
               env_file.write(f"STATICRYPT_SALT_RESOLVED={salt}\n")
@@ -310,6 +266,8 @@ jobs:
       - name: Convert markdown to HTML
         if: steps.stage.outputs.needed == 'true'
         shell: bash
+        env:
+          STAGE_DIR: ${{ runner.temp }}/staticrypt-stage
         run: |
           set -euo pipefail
           cd "$STAGE_DIR"
@@ -332,6 +290,8 @@ jobs:
       - name: Encrypt every page with StatiCrypt
         if: steps.stage.outputs.needed == 'true'
         shell: bash
+        env:
+          STAGE_DIR: ${{ runner.temp }}/staticrypt-stage
         run: |
           set -euo pipefail
           cd "$STAGE_DIR"
