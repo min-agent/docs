@@ -8,10 +8,9 @@
 #   Secrets
 #     DOCS_BOT_TOKEN        Fine-grained PAT or GitHub App token that can read
 #                           the code repo ("Contents: read") and, on this docs
-#                           repo, "Contents: read and write", "Actions: read and
-#                           write", "Secrets: read and write". GITHUB_TOKEN
-#                           cannot write repository secrets.
-#     STATICRYPT_PASSWORD   Set by set-staticrypt-password.yml, never here.
+#                           repo, "Contents: read and write".
+#     STATICRYPT_PASSWORD   Set manually in this repo's Actions secrets. It must
+#                           be at least 14 characters long.
 #   Variables
 #     STATICRYPT_SALT       Optional 32 character hex salt. When unset, a random
 #                           salt is generated once and kept in
@@ -26,8 +25,9 @@
 #
 # Password handling
 #   This workflow only reads STATICRYPT_PASSWORD. If the secret is missing or
-#   too short, it fails with an instruction to run set-staticrypt-password.yml.
-#   That workflow is the single place where the password is set or changed.
+#   too short, it fails with an instruction to set it manually. After changing
+#   the secret, run this workflow manually with rebuild_all set to true so every
+#   page is re-encrypted with the new password.
 
 name: Sync encrypted docs from tagged releases
 
@@ -82,10 +82,10 @@ jobs:
             missing=1
           fi
           if [ -z "${STATICRYPT_PASSWORD:-}" ]; then
-            echo "::error::STATICRYPT_PASSWORD is not set. Run the 'Set StatiCrypt password' workflow (set-staticrypt-password.yml) and enter the password there; it is saved as a repository secret and used automatically from then on."
+            echo "::error::STATICRYPT_PASSWORD is not set. Add it under Settings > Secrets and variables > Actions in this repository, with a value of at least 14 characters."
             missing=1
           elif [ "${#STATICRYPT_PASSWORD}" -lt 14 ]; then
-            echo "::error::STATICRYPT_PASSWORD is shorter than 14 characters. Rotate it with the 'Set StatiCrypt password' workflow."
+            echo "::error::STATICRYPT_PASSWORD is shorter than 14 characters. Update the repository secret, then run this workflow manually with rebuild_all set to true."
             missing=1
           fi
           exit "$missing"
