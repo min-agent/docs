@@ -1,0 +1,388 @@
+# Mirrors the `docs/` folder of every tag of the private code repo min-agent/Min
+# into this docs repo, regenerates the markdown source of docs/index so it links
+# every folder in docs/, converts pages to HTML, and encrypts every page with
+# StatiCrypt. StatiCrypt can only encrypt HTML, so the markdown index is
+# published as docs/index.html rather than docs/index.md.
+#
+# Required repository configuration
+#   Secrets
+#     DOCS_BOT_TOKEN        Fine-grained PAT or GitHub App token that can read
+#                           the code repo ("Contents: read") and, on this docs
+#                           repo, "Contents: read and write", "Actions: read and
+#                           write", "Secrets: read and write". GITHUB_TOKEN
+#                           cannot write repository secrets.
+#     STATICRYPT_PASSWORD   Set by set-staticrypt-password.yml, never here.
+#   Variables
+#     STATICRYPT_SALT       Optional 32 character hex salt. When unset, a random
+#                           salt is generated once and kept in
+#                           .github/docs-sync-state.json.
+#
+# Triggers
+#   repository_dispatch (type: code-repo-release, payload: {tag: "<tag>"}),
+#   sent by the code repo with:
+#     gh api repos/min-agent/DOCS_REPO/dispatches \
+#       -f event_type=code-repo-release -f client_payload[tag]="$TAG"
+#   A daily schedule re-scans the code repo so a missed dispatch is caught up.
+#
+# Password handling
+#   This workflow only reads STATICRYPT_PASSWORD. If the secret is missing or
+#   too short, it fails with an instruction to run set-staticrypt-password.yml.
+#   That workflow is the single place where the password is set or changed.
+
+name: Sync encrypted docs from tagged releases
+
+on:
+  repository_dispatch:
+    types: [code-repo-release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Single tag to sync. Leave empty to sync every tag that is not published yet."
+        required: false
+        type: string
+      rebuild_all:
+        description: "Re-import and re-encrypt every tag."
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "41 3 * * *"
+
+concurrency:
+  group: sync-encrypted-docs
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync and encrypt
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CODE_REPO: min-agent/Min
+      SYNC_TOKEN: ${{ secrets.DOCS_BOT_TOKEN }}
+      STATICRYPT_PASSWORD: ${{ secrets.STATICRYPT_PASSWORD }}
+      STATICRYPT_SALT: ${{ vars.STATICRYPT_SALT }}
+      TARGET_TAG: ${{ github.event.client_payload.tag || inputs.tag || '' }}
+      REBUILD_ALL: ${{ inputs.rebuild_all || 'false' }}
+      STAGE_DIR: ${{ runner.temp }}/staticrypt-stage
+      PANDOC_DIR: ${{ runner.temp }}/pandoc-tools
+      PANDOC_VERSION: "3.14"
+      PANDOC_SHA256: "c5f4720cdefb3f7bdc5d07202ef579feef0d1370773c873804dd8fdaa8c4f1b8"
+      STATICRYPT_VERSION: "3.5.4"
+    steps:
+      - name: Check required configuration
+        run: |
+          set -euo pipefail
+          missing=0
+          if [ -z "${SYNC_TOKEN:-}" ]; then
+            echo "::error::Secret DOCS_BOT_TOKEN is not set."
+            missing=1
+          fi
+          if [ -z "${STATICRYPT_PASSWORD:-}" ]; then
+            echo "::error::STATICRYPT_PASSWORD is not set. Run the 'Set StatiCrypt password' workflow (set-staticrypt-password.yml) and enter the password there; it is saved as a repository secret and used automatically from then on."
+            missing=1
+          elif [ "${#STATICRYPT_PASSWORD}" -lt 14 ]; then
+            echo "::error::STATICRYPT_PASSWORD is shorter than 14 characters. Rotate it with the 'Set StatiCrypt password' workflow."
+            missing=1
+          fi
+          exit "$missing"
+
+      - name: Check out the docs repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.DOCS_BOT_TOKEN }}
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Cache pinned tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            ${{ env.PANDOC_DIR }}
+          key: docs-tools-staticrypt-${{ env.STATICRYPT_VERSION }}-pandoc-${{ env.PANDOC_VERSION }}
+          restore-keys: docs-tools-staticrypt-${{ env.STATICRYPT_VERSION }}-pandoc-
+
+      - name: Install pinned pandoc
+        run: |
+          set -euo pipefail
+          mkdir -p "$PANDOC_DIR"
+          if [ ! -x "$PANDOC_DIR/pandoc" ]; then
+            curl --fail --silent --show-error --location \
+              --output "$PANDOC_DIR/pandoc.tar.gz" \
+              "https://github.com/jgm/pandoc/releases/download/${PANDOC_VERSION}/pandoc-${PANDOC_VERSION}-linux-amd64.tar.gz"
+            echo "${PANDOC_SHA256}  ${PANDOC_DIR}/pandoc.tar.gz" | sha256sum --check -
+            tar -xzf "$PANDOC_DIR/pandoc.tar.gz" -C "$PANDOC_DIR" \
+              --strip-components=2 "pandoc-${PANDOC_VERSION}/bin/pandoc"
+            rm -f "$PANDOC_DIR/pandoc.tar.gz"
+          fi
+          "$PANDOC_DIR/pandoc" --version | head -n 1
+          echo "$PANDOC_DIR" >> "$GITHUB_PATH"
+
+      - name: Stage documentation from new tags
+        id: stage
+        run: |
+          python3 - <<'PY'
+          import base64
+          import copy
+          import hashlib
+          import json
+          import os
+          import re
+          import secrets
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          def note(message):
+              print(f"::notice::{message}")
+
+          slug = os.environ["CODE_REPO"].strip().strip("/")
+          if slug.endswith(".git"):
+              slug = slug[:-4]
+          token = os.environ["SYNC_TOKEN"]
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          docs_dir = workspace / "docs"
+          state_path = workspace / ".github" / "docs-sync-state.json"
+          stage = Path(os.environ["STAGE_DIR"]).resolve()
+          target_tag = (os.environ.get("TARGET_TAG") or "").strip()
+          rebuild_all = (os.environ.get("REBUILD_ALL") or "").strip().lower() == "true"
+
+          # Pass git credentials through the environment, not argv, so the PAT
+          # never appears in a process listing or a git trace.
+          os.environ["GIT_CONFIG_COUNT"] = "1"
+          os.environ["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader"
+          os.environ["GIT_CONFIG_VALUE_0"] = "AUTHORIZATION: basic " + base64.b64encode(
+              ("x-access-token:" + token).encode("utf-8")).decode("ascii")
+
+          def run(args):
+              return subprocess.run(args, check=True, capture_output=True, text=True).stdout
+
+          shutil.rmtree(stage, ignore_errors=True)
+          stage.mkdir(parents=True)
+          docs_dir.mkdir(parents=True, exist_ok=True)
+          (docs_dir / ".nojekyll").touch()
+
+          state = {"tags": {}, "index_hash": None, "salt": None}
+          if state_path.exists():
+              state.update(json.loads(state_path.read_text(encoding="utf-8")))
+
+          remote = f"https://github.com/{slug}.git"
+
+          tags = {}
+          for line in run(["git", "ls-remote", "--tags", remote]).splitlines():
+              if not line.strip():
+                  continue
+              sha, ref = line.split("\t")
+              name = ref[len("refs/tags/"):]
+              if name.endswith("^{}"):
+                  tags[name[:-3]] = sha          # peeled commit of an annotated tag
+              else:
+                  tags.setdefault(name, sha)     # lightweight tag
+
+          if not tags:
+              note("The code repo has no tags.")
+          if target_tag and target_tag not in tags:
+              print(f"::error::Tag '{target_tag}' does not exist in {slug}.", file=sys.stderr)
+              sys.exit(1)
+
+          def folder_for(tag):
+              return re.sub(r"[^A-Za-z0-9._-]+", "-", tag).strip("-.")
+
+          imported, skipped, without_docs = [], [], []
+          used_folders = set()
+          new_state = copy.deepcopy(state)  # keep entries for tags outside a targeted run
+
+          for tag in sorted(tags):
+              if target_tag and tag != target_tag:
+                  continue
+              sha = tags[tag]
+              previous = state["tags"].get(tag, {})
+              folder = previous.get("folder") or folder_for(tag)
+              if not folder or folder in {".", ".."}:
+                  print(f"::error::Tag '{tag}' cannot be turned into a directory name.", file=sys.stderr)
+                  sys.exit(1)
+              base, suffix = folder, 0
+              while folder in used_folders:
+                  suffix += 1
+                  folder = f"{base}-{suffix}"
+              used_folders.add(folder)
+
+              destination = stage / folder
+              if (not rebuild_all
+                      and previous.get("sha") == sha
+                      and (previous.get("published") is False
+                           or (docs_dir / folder).is_dir())):
+                  skipped.append(tag)
+                  new_state["tags"][tag] = {"sha": sha, "folder": folder,
+                                            "published": previous.get("published", True)}
+                  continue
+
+              checkout = Path(tempfile.mkdtemp())
+              try:
+                  run(["git", "clone", "--quiet", "--depth", "1", "--filter=blob:none",
+                       "--sparse", "--branch", tag, remote, str(checkout)])
+                  if "docs" not in run(["git", "-C", str(checkout), "ls-tree", "--name-only", "HEAD"]).split():
+                      without_docs.append(tag)
+                      new_state["tags"][tag] = {"sha": sha, "folder": folder, "published": False}
+                      continue
+                  run(["git", "-C", str(checkout), "sparse-checkout", "set", "docs"])
+                  source = checkout / "docs"
+                  if not source.is_dir() or not any(p.is_file() for p in source.rglob("*")):
+                      without_docs.append(tag)
+                      new_state["tags"][tag] = {"sha": sha, "folder": folder, "published": False}
+                      continue
+
+                  shutil.copytree(source, destination, ignore=shutil.ignore_patterns(".git"))
+              finally:
+                  shutil.rmtree(checkout, ignore_errors=True)
+
+              # A re-pushed tag is rebuilt from scratch so stale pages do not
+              # survive the update.
+              shutil.rmtree(docs_dir / folder, ignore_errors=True)
+
+              # A directory link such as ./v1.2.0/ has to resolve to something.
+              index_names = {"index.md", "index.markdown", "index.html", "index.htm"}
+              if not any(p.is_file() and p.name.lower() in index_names
+                         for p in destination.iterdir()):
+                  entries = sorted(p.name for p in destination.iterdir()
+                                   if p.is_file() and not p.name.startswith("."))
+                  lines = [f"# {tag}", ""]
+                  lines += [f"- [{entry}](./{entry})" for entry in entries]
+                  (destination / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+              imported.append(tag)
+              new_state["tags"][tag] = {"sha": sha, "folder": folder, "published": True}
+
+          folders = sorted(
+              {p.name for p in docs_dir.iterdir() if p.is_dir() and not p.name.startswith(".")}
+              | {p.name for p in stage.iterdir() if p.is_dir()},
+          )
+
+          def version_key(name):
+              return tuple((0, int(part), "") if part.isdigit() else (1, 0, part.lower())
+                           for part in re.split(r"(\d+)", name))
+
+          index_lines = ["# Documentation", "",
+                         "Encrypted documentation for each tagged release.", ""]
+          index_lines += [f"- [{folder}](./{folder}/)" for folder in sorted(folders, key=version_key, reverse=True)]
+          index_source = "\n".join(index_lines) + "\n"
+          index_hash = hashlib.sha256(index_source.encode("utf-8")).hexdigest()
+
+          index_staged = (rebuild_all
+                          or state.get("index_hash") != index_hash
+                          or not (docs_dir / "index.html").exists())
+          if index_staged:
+              (stage / "index.md").write_text(index_source, encoding="utf-8")
+              new_state["index_hash"] = index_hash
+
+          salt = (os.environ.get("STATICRYPT_SALT") or "").strip() or state.get("salt") or secrets.token_hex(16)
+          new_state["salt"] = salt
+
+          state_path.parent.mkdir(parents=True, exist_ok=True)
+          state_path.write_text(json.dumps(new_state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+          if imported:
+              note("Imported: " + ", ".join(imported))
+          if skipped:
+              note("Already published: " + ", ".join(skipped))
+          if without_docs:
+              note("No docs/ folder at: " + ", ".join(without_docs))
+          note("Index regenerated." if index_staged else "Index unchanged.")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"STATICRYPT_SALT_RESOLVED={salt}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output_file:
+              needed = "true" if any(stage.iterdir()) else "false"
+              output_file.write(f"needed={needed}\n")
+          PY
+
+      - name: Convert markdown to HTML
+        if: steps.stage.outputs.needed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$STAGE_DIR"
+          while IFS= read -r -d '' source; do
+            target="${source%.*}.html"
+            if [ -e "$target" ]; then
+              echo "::error::Both ${source#./} and ${target#./} exist; refusing to overwrite an authored page."
+              exit 1
+            fi
+            relative="${source#./}"
+            title="${relative%.*}"
+            pandoc --from gfm --to html5 --standalone --metadata "title=$title" \
+                   --output "$target" "$source"
+            rm -f "$source"
+          done < <(find . -type f \( -iname '*.md' -o -iname '*.markdown' \) -print0)
+          find . -type f \( -iname '*.html' -o -iname '*.htm' \) -print0 \
+            | xargs -0 --no-run-if-empty sed -i -E \
+                's/href="([^"#]+)\.(md|markdown)(#[^"]*)?"/href="\1.html\3"/Ig'
+
+      - name: Encrypt every page with StatiCrypt
+        if: steps.stage.outputs.needed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$STAGE_DIR"
+          # The password is read from STATICRYPT_PASSWORD in the environment,
+          # never from argv.
+          npx --yes "staticrypt@${STATICRYPT_VERSION}" ./* \
+            --recursive \
+            --directory "$GITHUB_WORKSPACE/docs" \
+            --salt "$STATICRYPT_SALT_RESOLVED" \
+            --config false \
+            --short \
+            --template-title "Protected documentation"
+
+      - name: Verify that no page is left in clear text
+        if: steps.stage.outputs.needed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          plaintext="$(find "$GITHUB_WORKSPACE/docs" -type f \
+            \( -iname '*.md' -o -iname '*.markdown' \) -print -quit)"
+          if [ -n "$plaintext" ]; then
+            echo "::error::Plaintext markdown found under docs/: $plaintext"
+            exit 1
+          fi
+          html_pages="$(find "$GITHUB_WORKSPACE/docs" -type f \
+            \( -iname '*.html' -o -iname '*.htm' \) -print -quit)"
+          if [ -z "$html_pages" ]; then
+            echo "::error::No HTML pages were produced under docs/."
+            exit 1
+          fi
+          unencrypted="$(grep --recursive --files-without-match \
+            'staticryptEncryptedMsgUniqueVariableName' \
+            "$GITHUB_WORKSPACE/docs" \
+            --include='*.html' --include='*.htm' \
+            --include='*.HTML' --include='*.HTM' || true)"
+          if [ -n "$unencrypted" ]; then
+            echo "::error::These pages were not encrypted:"
+            printf '%s\n' "$unencrypted"
+            exit 1
+          fi
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "docs-sync-bot"
+          git config user.email "docs-sync-bot@users.noreply.github.com"
+          git add --all docs .github/docs-sync-state.json
+          if git diff --cached --quiet; then
+            echo "::notice::Nothing to commit."
+            exit 0
+          fi
+          git commit --message "docs: sync and encrypt documentation for tagged releases"
+          git push origin "HEAD:${{ github.event.repository.default_branch }}"
