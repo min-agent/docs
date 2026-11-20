@@ -464,6 +464,55 @@ jobs:
             xargs -0 --no-run-if-empty sed -i -E \
               's/href="([^"#]+)\.(md|markdown)(#[^"]*)?"/href="\1.html\3"/Ig'
 
+      - name: Inject custom CSS into every page
+        if: steps.stage.outputs.needed == 'true'
+        shell: bash
+        env:
+          STAGE_DIR: ${{ runner.temp }}/staticrypt-stage
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          stage = Path(os.environ["STAGE_DIR"]).resolve()
+          css_path = Path(os.environ["GITHUB_WORKSPACE"]) / "docs-custom.css"
+
+          if not css_path.is_file():
+              raise SystemExit(f"::error::Custom CSS file not found: {css_path}")
+
+          css = css_path.read_text(encoding="utf-8").strip()
+          if not css:
+              print("::notice::Custom CSS file is empty; nothing to inject.")
+              raise SystemExit(0)
+
+          # Inlined so the rules are part of the HTML that StatiCrypt encrypts,
+          # rather than a separate clear-text file or the password template.
+          style_block = f"<style>\n{css}\n</style>\n"
+
+          injected = 0
+          for page in sorted(stage.rglob("*")):
+              if not page.is_file() or page.suffix.lower() not in {".html", ".htm"}:
+                  continue
+
+              html = page.read_text(encoding="utf-8")
+              lowered = html.lower()
+              head_close = lowered.find("</head>")
+
+              if head_close != -1:
+                  html = html[:head_close] + style_block + html[head_close:]
+              elif lowered.find("<html") != -1:
+                  html_tag_end = lowered.find(">", lowered.find("<html")) + 1
+                  html = html[:html_tag_end] + "\n" + style_block + html[html_tag_end:]
+              else:
+                  html = style_block + html
+
+              page.write_text(html, encoding="utf-8")
+              injected += 1
+
+          print(f"::notice::Injected custom CSS into {injected} page(s).")
+          PY
+
       - name: Encrypt every page with StatiCrypt
         if: steps.stage.outputs.needed == 'true'
         shell: bash
