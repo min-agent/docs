@@ -22,13 +22,10 @@
 # Triggers
 #   repository_dispatch (type: code-repo-release) from the code repo, a daily
 #   schedule, and manual runs from the Actions tab. Payloads are ignored.
-#   A tag is fetched from:
-#     https://github.com/min-agent/Min.git
 #
 # Password handling
 #   This workflow only reads STATICRYPT_PASSWORD. If the secret is missing or
-#   too short, it fails with an instruction to set it manually. After changing
-#   the secret, run this workflow again; every run re-encrypts all pages.
+#   too short, it fails with an instruction to set it manually.
 
 name: Sync encrypted docs from tagged releases
 
@@ -59,15 +56,19 @@ jobs:
       PANDOC_VERSION: "3.14"
       PANDOC_SHA256: "c5f4720cdefb3f7bdc5d07202ef579feef0d1370773c873804dd8fdaa8c4f1b8"
       STATICRYPT_VERSION: "3.5.4"
+
     steps:
       - name: Check required configuration
+        shell: bash
         run: |
           set -euo pipefail
           missing=0
+
           if [ -z "${SYNC_TOKEN:-}" ]; then
             echo "::error::Secret DOCS_BOT_TOKEN is not set."
             missing=1
           fi
+
           if [ -z "${STATICRYPT_PASSWORD:-}" ]; then
             echo "::error::STATICRYPT_PASSWORD is not set. Add it under Settings > Secrets and variables > Actions in this repository, with a value of at least 14 characters."
             missing=1
@@ -75,6 +76,7 @@ jobs:
             echo "::error::STATICRYPT_PASSWORD is shorter than 14 characters. Update the repository secret and run this workflow again."
             missing=1
           fi
+
           exit "$missing"
 
       - name: Check out the docs repo
@@ -83,6 +85,7 @@ jobs:
           token: ${{ secrets.DOCS_BOT_TOKEN }}
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
+          persist-credentials: true
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -104,15 +107,20 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$PANDOC_DIR"
+
           if [ ! -x "$PANDOC_DIR/pandoc" ]; then
             curl --fail --silent --show-error --location \
               --output "$PANDOC_DIR/pandoc.tar.gz" \
               "https://github.com/jgm/pandoc/releases/download/${PANDOC_VERSION}/pandoc-${PANDOC_VERSION}-linux-amd64.tar.gz"
+
             echo "${PANDOC_SHA256}  ${PANDOC_DIR}/pandoc.tar.gz" | sha256sum --check -
+
             tar -xzf "$PANDOC_DIR/pandoc.tar.gz" -C "$PANDOC_DIR" \
               --strip-components=2 "pandoc-${PANDOC_VERSION}/bin/pandoc"
+
             rm -f "$PANDOC_DIR/pandoc.tar.gz"
           fi
+
           "$PANDOC_DIR/pandoc" --version | head -n 1
           echo "$PANDOC_DIR" >> "$GITHUB_PATH"
 
@@ -122,7 +130,6 @@ jobs:
           STAGE_DIR: ${{ runner.temp }}/staticrypt-stage
         run: |
           python3 - <<'PY'
-          import base64
           import json
           import os
           import re
@@ -139,21 +146,55 @@ jobs:
           slug = os.environ["CODE_REPO"].strip().strip("/")
           if slug.endswith(".git"):
               slug = slug[:-4]
+
           token = os.environ["SYNC_TOKEN"]
           workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
           docs_dir = workspace / "docs"
           state_path = workspace / ".github" / "docs-sync-state.json"
           stage = Path(os.environ["STAGE_DIR"]).resolve()
 
-          # Pass git credentials through the environment, not argv, so the PAT
-          # never appears in a process listing or a git trace.
-          os.environ["GIT_CONFIG_COUNT"] = "1"
-          os.environ["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader"
-          os.environ["GIT_CONFIG_VALUE_0"] = "AUTHORIZATION: basic " + base64.b64encode(
-              ("x-access-token:" + token).encode("utf-8")).decode("ascii")
+          # Configure a one-process Git credential helper using a temporary
+          # executable. The secret is never placed in argv, the remote URL,
+          # an extra header, or process-list-visible command arguments.
+          username = "x-access-token"
+          askpass = Path(tempfile.mkdtemp()) / "git-askpass.py"
+
+          askpass.write_text(
+              "#!/usr/bin/python3\n"
+              "import os\n"
+              "import sys\n"
+              "prompt = sys.argv[1].lower()\n"
+              "if 'username' in prompt:\n"
+              "    print(os.environ['GIT_AUTH_USERNAME'])\n"
+              "else:\n"
+              "    print(os.environ['GIT_AUTH_PASSWORD'])\n",
+              encoding="utf-8",
+          )
+          askpass.chmod(0o700)
+
+          os.environ["GIT_AUTH_USERNAME"] = username
+          os.environ["GIT_AUTH_PASSWORD"] = token
+          os.environ["GIT_ASKPASS"] = str(askpass)
+          os.environ["GIT_TERMINAL_PROMPT"] = "0"
+          os.environ["GCM_INTERACTIVE"] = "never"
 
           def run(args):
-              return subprocess.run(args, check=True, capture_output=True, text=True).stdout
+              try:
+                  return subprocess.run(
+                      args,
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                  ).stdout
+              except subprocess.CalledProcessError as error:
+                  diagnostic = (error.stderr or "").strip()
+                  if token:
+                      diagnostic = diagnostic.replace(token, "[REDACTED]")
+                  print(
+                      f"::error::Git command failed: {diagnostic}",
+                      file=sys.stderr,
+                  )
+                  raise
 
           shutil.rmtree(stage, ignore_errors=True)
           stage.mkdir(parents=True)
@@ -170,12 +211,14 @@ jobs:
           for line in run(["git", "ls-remote", "--tags", remote]).splitlines():
               if not line.strip():
                   continue
+
               sha, ref = line.split("\t")
               name = ref[len("refs/tags/"):]
+
               if name.endswith("^{}"):
-                  tags[name[:-3]] = sha          # peeled commit of an annotated tag
+                  tags[name[:-3]] = sha
               else:
-                  tags.setdefault(name, sha)     # lightweight tag
+                  tags.setdefault(name, sha)
 
           if not tags:
               note("The code repo has no tags.")
@@ -183,82 +226,199 @@ jobs:
           def folder_for(tag):
               return re.sub(r"[^A-Za-z0-9._-]+", "-", tag).strip("-.")
 
-          imported, without_docs = [], []
+          imported = []
+          without_docs = []
           used_folders = set()
 
-          # No cache, no SHA check, no target tag: every tag is cloned and
-          # staged on every run.
           for tag in sorted(tags):
               folder = folder_for(tag)
+
               if not folder or folder in {".", ".."}:
-                  print(f"::error::Tag '{tag}' cannot be turned into a directory name.", file=sys.stderr)
+                  print(
+                      f"::error::Tag '{tag}' cannot be turned into a directory name.",
+                      file=sys.stderr,
+                  )
                   sys.exit(1)
-              base, suffix = folder, 0
+
+              base = folder
+              suffix = 0
               while folder in used_folders:
                   suffix += 1
                   folder = f"{base}-{suffix}"
+
               used_folders.add(folder)
 
               destination = stage / folder
               checkout = Path(tempfile.mkdtemp())
+
               try:
-                  run(["git", "clone", "--quiet", "--depth", "1", "--filter=blob:none",
-                       "--sparse", "--branch", tag, remote, str(checkout)])
-                  if "docs" not in run(["git", "-C", str(checkout), "ls-tree", "--name-only", "HEAD"]).split():
-                      without_docs.append(tag)
-                      continue
-                  run(["git", "-C", str(checkout), "sparse-checkout", "set", "docs"])
-                  source = checkout / "docs"
-                  if not source.is_dir() or not any(p.is_file() for p in source.rglob("*")):
+                  run([
+                      "git",
+                      "clone",
+                      "--quiet",
+                      "--depth",
+                      "1",
+                      "--filter=blob:none",
+                      "--sparse",
+                      "--branch",
+                      tag,
+                      remote,
+                      str(checkout),
+                  ])
+
+                  if "docs" not in run([
+                      "git",
+                      "-C",
+                      str(checkout),
+                      "ls-tree",
+                      "--name-only",
+                      "HEAD",
+                  ]).split():
                       without_docs.append(tag)
                       continue
 
-                  shutil.copytree(source, destination, ignore=shutil.ignore_patterns(".git"))
+                  run([
+                      "git",
+                      "-C",
+                      str(checkout),
+                      "sparse-checkout",
+                      "set",
+                      "docs",
+                  ])
+
+                  source = checkout / "docs"
+
+                  if (
+                      not source.is_dir()
+                      or not any(p.is_file() for p in source.rglob("*"))
+                  ):
+                      without_docs.append(tag)
+                      continue
+
+                  shutil.copytree(
+                      source,
+                      destination,
+                      ignore=shutil.ignore_patterns(".git"),
+                  )
               finally:
                   shutil.rmtree(checkout, ignore_errors=True)
 
-              # Replacing the folder from scratch also removes stale pages.
               shutil.rmtree(docs_dir / folder, ignore_errors=True)
 
-              # A directory link such as ./v1.2.0/ has to resolve to something.
-              index_names = {"index.md", "index.markdown", "index.html", "index.htm"}
-              if not any(p.is_file() and p.name.lower() in index_names
-                         for p in destination.iterdir()):
-                  entries = sorted(p.name for p in destination.iterdir()
-                                   if p.is_file() and not p.name.startswith("."))
+              index_names = {
+                  "index.md",
+                  "index.markdown",
+                  "index.html",
+                  "index.htm",
+              }
+
+              if not any(
+                  p.is_file()
+                  and p.name.lower() in index_names
+                  for p in destination.iterdir()
+              ):
+                  entries = sorted(
+                      p.name
+                      for p in destination.iterdir()
+                      if p.is_file() and not p.name.startswith(".")
+                  )
                   lines = [f"# {tag}", ""]
-                  lines += [f"- [{entry}](./{entry})" for entry in entries]
-                  (destination / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+                  lines += [
+                      f"- [{entry}](./{entry})"
+                      for entry in entries
+                  ]
+                  (destination / "index.md").write_text(
+                      "\n".join(lines) + "\n",
+                      encoding="utf-8",
+                  )
 
               imported.append(tag)
 
           folders = sorted(
-              {p.name for p in docs_dir.iterdir() if p.is_dir() and not p.name.startswith(".")}
-              | {p.name for p in stage.iterdir() if p.is_dir()},
+              {
+                  p.name
+                  for p in docs_dir.iterdir()
+                  if p.is_dir() and not p.name.startswith(".")
+              }
+              | {
+                  p.name
+                  for p in stage.iterdir()
+                  if p.is_dir()
+              },
           )
 
           def version_key(name):
-              return tuple((0, int(part), "") if part.isdigit() else (1, 0, part.lower())
-                           for part in re.split(r"(\d+)", name))
+              return tuple(
+                  (
+                      0,
+                      int(part),
+                      "",
+                  )
+                  if part.isdigit()
+                  else (
+                      1,
+                      0,
+                      part.lower(),
+                  )
+                  for part in re.split(r"(\d+)", name)
+              )
 
-          index_lines = ["# Documentation", "",
-                         "Encrypted documentation for each tagged release.", ""]
-          index_lines += [f"- [{folder}](./{folder}/)" for folder in sorted(folders, key=version_key, reverse=True)]
-          (stage / "index.md").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
+          index_lines = [
+              "# Documentation",
+              "",
+              "Encrypted documentation for each tagged release.",
+              "",
+          ]
+          index_lines += [
+              f"- [{folder}](./{folder}/)"
+              for folder in sorted(
+                  folders,
+                  key=version_key,
+                  reverse=True,
+              )
+          ]
 
-          salt = (os.environ.get("STATICRYPT_SALT") or "").strip() or state.get("salt") or secrets.token_hex(16)
+          (stage / "index.md").write_text(
+              "\n".join(index_lines) + "\n",
+              encoding="utf-8",
+          )
+
+          salt = (
+              os.environ.get("STATICRYPT_SALT") or ""
+          ).strip() or state.get("salt") or secrets.token_hex(16)
+
           state_path.parent.mkdir(parents=True, exist_ok=True)
-          state_path.write_text(json.dumps({"salt": salt}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          state_path.write_text(
+              json.dumps(
+                  {"salt": salt},
+                  indent=2,
+                  sort_keys=True,
+              ) + "\n",
+              encoding="utf-8",
+          )
 
           if imported:
               note("Imported: " + ", ".join(imported))
+
           if without_docs:
               note("No docs/ folder at: " + ", ".join(without_docs))
+
           note("Index regenerated.")
 
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
-              env_file.write(f"STATICRYPT_SALT_RESOLVED={salt}\n")
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output_file:
+          with open(
+              os.environ["GITHUB_ENV"],
+              "a",
+              encoding="utf-8",
+          ) as env_file:
+              env_file.write(
+                  f"STATICRYPT_SALT_RESOLVED={salt}\n"
+              )
+
+          with open(
+              os.environ["GITHUB_OUTPUT"],
+              "a",
+              encoding="utf-8",
+          ) as output_file:
               needed = "true" if any(stage.iterdir()) else "false"
               output_file.write(f"needed={needed}\n")
           PY
@@ -271,21 +431,38 @@ jobs:
         run: |
           set -euo pipefail
           cd "$STAGE_DIR"
+
           while IFS= read -r -d '' source; do
             target="${source%.*}.html"
+
             if [ -e "$target" ]; then
               echo "::error::Both ${source#./} and ${target#./} exist; refusing to overwrite an authored page."
               exit 1
             fi
+
             relative="${source#./}"
             title="${relative%.*}"
-            pandoc --from gfm --to html5 --standalone --metadata "title=$title" \
-                   --output "$target" "$source"
+
+            pandoc \
+              --from gfm \
+              --to html5 \
+              --standalone \
+              --metadata "title=$title" \
+              --output "$target" \
+              "$source"
+
             rm -f "$source"
-          done < <(find . -type f \( -iname '*.md' -o -iname '*.markdown' \) -print0)
-          find . -type f \( -iname '*.html' -o -iname '*.htm' \) -print0 \
-            | xargs -0 --no-run-if-empty sed -i -E \
-                's/href="([^"#]+)\.(md|markdown)(#[^"]*)?"/href="\1.html\3"/Ig'
+          done < <(
+            find . -type f \
+              \( -iname '*.md' -o -iname '*.markdown' \) \
+              -print0
+          )
+
+          find . -type f \
+            \( -iname '*.html' -o -iname '*.htm' \) \
+            -print0 |
+            xargs -0 --no-run-if-empty sed -i -E \
+              's/href="([^"#]+)\.(md|markdown)(#[^"]*)?"/href="\1.html\3"/Ig'
 
       - name: Encrypt every page with StatiCrypt
         if: steps.stage.outputs.needed == 'true'
@@ -295,8 +472,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$STAGE_DIR"
-          # The password is read from STATICRYPT_PASSWORD in the environment,
-          # never from argv.
+
           npx --yes "staticrypt@${STATICRYPT_VERSION}" ./* \
             --recursive \
             --directory "$GITHUB_WORKSPACE/docs" \
@@ -310,23 +486,38 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          plaintext="$(find "$GITHUB_WORKSPACE/docs" -type f \
-            \( -iname '*.md' -o -iname '*.markdown' \) -print -quit)"
+
+          plaintext="$(
+            find "$GITHUB_WORKSPACE/docs" -type f \
+              \( -iname '*.md' -o -iname '*.markdown' \) \
+              -print -quit
+          )"
+
           if [ -n "$plaintext" ]; then
             echo "::error::Plaintext markdown found under docs/: $plaintext"
             exit 1
           fi
-          html_pages="$(find "$GITHUB_WORKSPACE/docs" -type f \
-            \( -iname '*.html' -o -iname '*.htm' \) -print -quit)"
+
+          html_pages="$(
+            find "$GITHUB_WORKSPACE/docs" -type f \
+              \( -iname '*.html' -o -iname '*.htm' \) \
+              -print -quit
+          )"
+
           if [ -z "$html_pages" ]; then
             echo "::error::No HTML pages were produced under docs/."
             exit 1
           fi
-          unencrypted="$(grep --recursive --files-without-match \
-            'staticryptEncryptedMsgUniqueVariableName' \
-            "$GITHUB_WORKSPACE/docs" \
-            --include='*.html' --include='*.htm' \
-            --include='*.HTML' --include='*.HTM' || true)"
+
+          unencrypted="$(
+            grep --recursive --files-without-match \
+              'staticryptEncryptedMsgUniqueVariableName' \
+              "$GITHUB_WORKSPACE/docs" \
+              --include='*.html' --include='*.htm' \
+              --include='*.HTML' --include='*.HTM' ||
+            true
+          )"
+
           if [ -n "$unencrypted" ]; then
             echo "::error::These pages were not encrypted:"
             printf '%s\n' "$unencrypted"
@@ -337,12 +528,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           git config user.name "docs-sync-bot"
           git config user.email "docs-sync-bot@users.noreply.github.com"
+
           git add --all docs .github/docs-sync-state.json
+
           if git diff --cached --quiet; then
             echo "::notice::Nothing to commit."
             exit 0
           fi
-          git commit --message "docs: sync and encrypt documentation for tagged releases"
-          git push origin "HEAD:${{ github.event.repository.default_branch }}"
+
+          git commit \
+            --message "docs: sync and encrypt documentation for tagged releases"
+
+          git push \
+            origin \
+            "HEAD:${{ github.event.repository.default_branch }}"
