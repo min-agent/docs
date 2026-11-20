@@ -1,8 +1,9 @@
 # Mirrors the `docs/` folder of every tag of the private code repo min-agent/Min
 # into this docs repo, regenerates the markdown source of docs/index so it links
-# every folder in docs/, converts pages to HTML, and encrypts every page with
-# StatiCrypt. StatiCrypt can only encrypt HTML, so the markdown index is
-# published as docs/index.html rather than docs/index.md.
+# every folder in docs/, converts pages to HTML, encrypts every page with
+# StatiCrypt, commits the result, and publishes docs/ to GitHub Pages.
+# StatiCrypt can only encrypt HTML, so the markdown index is published as
+# docs/index.html rather than docs/index.md.
 #
 # Every run is a full rebuild: all tags are cloned again from scratch and every
 # page is re-encrypted. The workflow takes no parameters.
@@ -20,34 +21,43 @@
 #                           .github/docs-sync-state.json.
 #
 # Triggers
-#   repository_dispatch (type: code-repo-release) from the code repo, a daily
-#   schedule, and manual runs from the Actions tab. Payloads are ignored.
+#   push and merged pull requests in this repo, repository_dispatch
+#   (type: code-repo-release) sent by min-agent/Min on a release, and manual
+#   runs from the Actions tab. Payloads are ignored.
 #
 # Password handling
 #   This workflow only reads STATICRYPT_PASSWORD. If the secret is missing or
 #   too short, it fails with an instruction to set it manually.
 
-name: Sync encrypted docs from tagged releases
+name: Sync, encrypt, and publish docs
 
 on:
+  push:
+    branches: ["main"]
+  pull_request_target:
+    types: [closed]
   repository_dispatch:
     types: [code-repo-release]
   workflow_dispatch:
-  schedule:
-    - cron: "41 3 * * *"
 
 concurrency:
-  group: sync-encrypted-docs
+  group: "pages"
   cancel-in-progress: false
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 jobs:
   sync:
-    name: Sync and encrypt
+    name: Sync, encrypt, and publish
+    if: github.event_name != 'pull_request_target' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     env:
       CODE_REPO: min-agent/Min
       SYNC_TOKEN: ${{ secrets.DOCS_BOT_TOKEN }}
@@ -589,8 +599,19 @@ jobs:
           fi
 
           git commit \
-            --message "docs: sync and encrypt documentation for tagged releases"
+            --message "docs: sync and encrypt documentation for tagged releases [skip ci]"
 
           git push \
             origin \
             "HEAD:${{ github.event.repository.default_branch }}"
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # Upload only the docs directory so it becomes the site root
+          path: './docs'
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
