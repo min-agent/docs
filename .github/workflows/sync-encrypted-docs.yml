@@ -11,8 +11,7 @@
 # Required repository configuration
 #   Secrets
 #     DOCS_BOT_TOKEN        Fine-grained PAT or GitHub App token that can read
-#                           the code repo ("Contents: read") and, on this docs
-#                           repo, "Contents: read and write".
+#                           the code repo ("Contents: read").
 #     STATICRYPT_PASSWORD   Set manually in this repo's Actions secrets. It must
 #                           be at least 14 characters long.
 #   Variables
@@ -92,7 +91,9 @@ jobs:
       - name: Check out the docs repo
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.DOCS_BOT_TOKEN }}
+          # This token is persisted and used by "Commit and push" below, so it
+          # must be the one with `contents: write` from the workflow permissions.
+          token: ${{ github.token }}
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
           persist-credentials: true
