@@ -91,9 +91,9 @@ jobs:
       - name: Check out the docs repo
         uses: actions/checkout@v4
         with:
-          # This token is persisted and used by "Commit and push" below, so it
-          # must be the one with `contents: write` from the workflow permissions.
-          token: ${{ github.token }}
+          # Kept so the staging step can read the private code repo through
+          # git's persisted extraheader. The push below overrides this token.
+          token: ${{ secrets.DOCS_BOT_TOKEN }}
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
           persist-credentials: true
@@ -681,6 +681,8 @@ jobs:
 
       - name: Commit and push
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -697,7 +699,12 @@ jobs:
           git commit \
             --message "docs: sync and encrypt documentation for tagged releases [skip ci]"
 
-          git push \
+          # DOCS_BOT_TOKEN cannot write to this repo, so authenticate the push
+          # with the workflow token, which has `contents: write` from the
+          # workflow permissions block above.
+          auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 --wrap=0)"
+          git -c "http.https://github.com/.extraheader=$auth_header" \
+            push \
             origin \
             "HEAD:${{ github.event.repository.default_branch }}"
 
