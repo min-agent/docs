@@ -591,28 +591,28 @@ jobs:
 
           injected = 0
           for page in pages:
-              html = page.read_text(encoding="utf-8")
-              lowered = html.lower()
+              page_html = page.read_text(encoding="utf-8")
+              lowered = page_html.lower()
               head_close = lowered.find("</head>")
 
               if head_close != -1:
-                  html = html[:head_close] + style_block + html[head_close:]
+                  page_html = page_html[:head_close] + style_block + page_html[head_close:]
               elif lowered.find("<html") != -1:
                   html_tag_end = lowered.find(">", lowered.find("<html")) + 1
-                  html = html[:html_tag_end] + "\n" + style_block + html[html_tag_end:]
+                  page_html = page_html[:html_tag_end] + "\n" + style_block + page_html[html_tag_end:]
               else:
-                  html = style_block + html
+                  page_html = style_block + page_html
 
               # The sidebar has to live in <body>, so find that tag in the
               # (already modified) document and insert the tree right after it.
-              body_match = re.search(r"<body\b[^>]*>", html, flags=re.IGNORECASE)
+              body_match = re.search(r"<body\b[^>]*>", page_html, flags=re.IGNORECASE)
               if body_match:
                   insert_at = body_match.end()
-                  html = html[:insert_at] + "\n" + build_nav(page) + html[insert_at:]
+                  page_html = page_html[:insert_at] + "\n" + build_nav(page) + page_html[insert_at:]
               else:
-                  html += "\n" + build_nav(page)
+                  page_html += "\n" + build_nav(page)
 
-              page.write_text(html, encoding="utf-8")
+              page.write_text(page_html, encoding="utf-8")
               injected += 1
 
           print(f"::notice::Injected custom CSS and navigation into {injected} page(s).")
