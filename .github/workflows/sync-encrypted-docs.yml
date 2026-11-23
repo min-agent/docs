@@ -3,8 +3,9 @@
 # every folder in docs/, converts pages to HTML, encrypts every page with
 # StatiCrypt, commits the result, and publishes docs/ to GitHub Pages.
 #
-# The min_logo.png asset at the repository root is copied into the site and
-# shown in the navigation heading of every generated page.
+# The min_logo.png asset at the repository root is copied into the site,
+# shown in the navigation heading and password prompt of every generated
+# page, and used as the favicon of both the prompt and the decrypted page.
 # StatiCrypt can only encrypt HTML, so the markdown index is published as
 # docs/index.html rather than docs/index.md.
 #
@@ -612,14 +613,18 @@ jobs:
               page_html = page.read_text(encoding="utf-8")
               lowered = page_html.lower()
               head_close = lowered.find("</head>")
+              logo = os.path.relpath(stage / "min_logo.png", start=page.parent)
+              logo_href = quote(logo.replace(os.sep, "/"), safe="/")
+              icon_block = f'<link rel="icon" type="image/png" href="{logo_href}" />\n'
+              head_block = icon_block + style_block
 
               if head_close != -1:
-                  page_html = page_html[:head_close] + style_block + page_html[head_close:]
+                  page_html = page_html[:head_close] + head_block + page_html[head_close:]
               elif lowered.find("<html") != -1:
                   html_tag_end = lowered.find(">", lowered.find("<html")) + 1
-                  page_html = page_html[:html_tag_end] + "\n" + style_block + page_html[html_tag_end:]
+                  page_html = page_html[:html_tag_end] + "\n" + head_block + page_html[html_tag_end:]
               else:
-                  page_html = style_block + page_html
+                  page_html = head_block + page_html
 
               # The sidebar has to live in <body>, so find that tag in the
               # (already modified) document and insert the tree right after it.
@@ -652,6 +657,67 @@ jobs:
             --config false \
             --short \
             --template-title "Protected documentation"
+
+      - name: Add the logo and favicon to the password prompt
+        if: steps.stage.outputs.needed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from urllib.parse import quote
+
+          site = Path(os.environ["GITHUB_WORKSPACE"]) / "docs"
+          logo = site / "min_logo.png"
+
+          if not logo.is_file():
+              raise SystemExit(f"::error::Logo asset was not published: {logo}")
+
+          prompt_style = (
+              "<style>\n"
+              ".min-prompt-logo { display: block; width: 96px; height: 96px; "
+              "margin: 0 auto 1rem; object-fit: contain; }\n"
+              "</style>\n"
+          )
+
+          for page in sorted(
+              p for p in site.rglob("*")
+              if p.is_file() and p.suffix.lower() in {".html", ".htm"}
+          ):
+              href = quote(
+                  os.path.relpath(logo, start=page.parent).replace(os.sep, "/"),
+                  safe="/",
+              )
+              page_html = page.read_text(encoding="utf-8")
+              head_close = page_html.lower().find("</head>")
+
+              if head_close == -1:
+                  raise SystemExit(f"::error::No </head> in {page}")
+
+              # StatiCrypt writes this clear-text shell; its script replaces
+              # the whole document on decryption, so the decrypted page gets
+              # its own favicon from the injection step before encryption.
+              if "staticrypt-form" not in page_html:
+                  continue
+
+              page_html = page_html[:head_close] + prompt_style + page_html[head_close:]
+
+              title = '<p class="staticrypt-title">'
+              title_at = page_html.find(title)
+              if title_at == -1:
+                  raise SystemExit(f"::error::No password prompt title in {page}")
+              prompt_logo = f'<img class="min-prompt-logo" src="{href}" alt="Min" />\n'
+              page_html = page_html[:title_at] + prompt_logo + page_html[title_at:]
+
+              head_close = page_html.lower().find("</head>")
+              icon = f'<link rel="icon" type="image/png" href="{href}" />\n'
+              page_html = page_html[:head_close] + icon + page_html[head_close:]
+
+              page.write_text(page_html, encoding="utf-8")
+
+          print("::notice::Added the logo and favicon to every password prompt.")
+          PY
 
       - name: Verify that no page is left in clear text
         if: steps.stage.outputs.needed == 'true'
