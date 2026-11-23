@@ -2,6 +2,9 @@
 # into this docs repo, regenerates the markdown source of docs/index so it links
 # every folder in docs/, converts pages to HTML, encrypts every page with
 # StatiCrypt, commits the result, and publishes docs/ to GitHub Pages.
+#
+# The min_logo.png asset at the repository root is copied into the site and
+# shown in the navigation heading of every generated page.
 # StatiCrypt can only encrypt HTML, so the markdown index is published as
 # docs/index.html rather than docs/index.md.
 #
@@ -486,14 +489,24 @@ jobs:
           import html
           import os
           import re
+          import shutil
           from pathlib import Path
           from urllib.parse import quote
 
           stage = Path(os.environ["STAGE_DIR"]).resolve()
-          css_path = Path(os.environ["GITHUB_WORKSPACE"]) / "docs-custom.css"
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          css_path = workspace / "docs-custom.css"
+          logo_path = workspace / "min_logo.png"
 
           if not css_path.is_file():
               raise SystemExit(f"::error::Custom CSS file not found: {css_path}")
+
+          if not logo_path.is_file():
+              raise SystemExit(f"::error::Logo file not found: {logo_path}")
+
+          # StatiCrypt copies non-HTML files from the stage to the published
+          # site, so a logo at the stage root is served from the site root.
+          shutil.copy2(logo_path, stage / "min_logo.png")
 
           css = css_path.read_text(encoding="utf-8").strip()
           if not css:
@@ -579,10 +592,14 @@ jobs:
               current_parts = current.relative_to(stage).parts
               home = os.path.relpath(stage / "index.html", start=current.parent)
               home_href = quote(home.replace(os.sep, "/"), safe="/")
+              logo = os.path.relpath(stage / "min_logo.png", start=current.parent)
+              logo_href = quote(logo.replace(os.sep, "/"), safe="/")
               return (
                   '<nav class="docs-nav" aria-label="Documentation navigation">\n'
-                  '<div class="docs-nav-heading">'
-                  f'<a href="{home_href}">Documentation</a>'
+                  '<div class="docs-nav-heading">\n'
+                  f'<a class="docs-nav-brand" href="{home_href}">'
+                  f'<img class="docs-nav-logo" src="{logo_href}" alt="" />'
+                  "<span>Documentation</span></a>\n"
                   "</div>\n"
                   f'<ul class="nav-list">\n'
                   f'{render(tree, (), current, current_parts, top=True)}\n'
