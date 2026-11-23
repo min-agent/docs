@@ -474,7 +474,7 @@ jobs:
             xargs -0 --no-run-if-empty sed -i -E \
               's/href="([^"#]+)\.(md|markdown)(#[^"]*)?"/href="\1.html\3"/Ig'
 
-      - name: Inject custom CSS into every page
+      - name: Inject custom CSS and navigation into every page
         if: steps.stage.outputs.needed == 'true'
         shell: bash
         env:
@@ -482,8 +482,11 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          import html
           import os
+          import re
           from pathlib import Path
+          from urllib.parse import quote
 
           stage = Path(os.environ["STAGE_DIR"]).resolve()
           css_path = Path(os.environ["GITHUB_WORKSPACE"]) / "docs-custom.css"
@@ -500,11 +503,94 @@ jobs:
           # rather than a separate clear-text file or the password template.
           style_block = f"<style>\n{css}\n</style>\n"
 
-          injected = 0
-          for page in sorted(stage.rglob("*")):
-              if not page.is_file() or page.suffix.lower() not in {".html", ".htm"}:
-                  continue
+          pages = sorted(
+              p for p in stage.rglob("*")
+              if p.is_file() and p.suffix.lower() in {".html", ".htm"}
+          )
 
+          def version_key(name):
+              return tuple(
+                  (0, int(part), "") if part.isdigit() else (1, 0, part.lower())
+                  for part in re.split(r"(\d+)", name)
+              )
+
+          def make_label(page):
+              stem = page.stem
+              if stem.lower() == "index":
+                  return "Overview"
+              return " ".join(
+                  word[:1].upper() + word[1:]
+                  for word in re.split(r"[-_]+", stem)
+                  if word
+              )
+
+          def page_href(target, current):
+              relative = os.path.relpath(target, start=current.parent)
+              return quote(relative.replace(os.sep, "/"), safe="/")
+
+          def link_item(page, current):
+              is_current = page == current
+              classes = "nav-link is-current" if is_current else "nav-link"
+              current_attr = ' aria-current="page"' if is_current else ""
+              return (
+                  f'<li><a class="{classes}" href="{page_href(page, current)}"'
+                  f'{current_attr}>{html.escape(make_label(page))}</a></li>'
+              )
+
+          # Build a tree of directories and the pages they contain.
+          tree = {"dirs": {}, "files": []}
+          for page in pages:
+              rel = page.relative_to(stage).parts
+              node = tree
+              for part in rel[:-1]:
+                  node = node["dirs"].setdefault(part, {"dirs": {}, "files": []})
+              node["files"].append(page)
+
+          def render(node, path_parts, current, current_parts, top=False):
+              files = sorted(
+                  (p for p in node["files"] if not (top and p.stem.lower() == "index")),
+                  key=lambda p: version_key(p.name),
+              )
+              dirs = sorted(node["dirs"].items(), key=lambda kv: version_key(kv[0]))
+
+              items = [(version_key(p.name), link_item(p, current)) for p in files]
+              for name, child in dirs:
+                  child_parts = path_parts + (name,)
+                  # Only sections on the path to the current page start expanded.
+                  open_attr = (
+                      " open" if child_parts == current_parts[: len(child_parts)] else ""
+                  )
+                  items.append((
+                      version_key(name),
+                      '<li><details class="nav-section"' + open_attr + ">\n"
+                      f"<summary>{html.escape(name)}</summary>\n"
+                      f'<ul class="nav-list">\n'
+                      f'{render(child, child_parts, current, current_parts)}\n'
+                      "</ul>\n"
+                      "</details></li>",
+                  ))
+
+              # Versions are listed newest first; everything else is alphabetical.
+              items.sort(key=lambda item: item[0], reverse=top)
+              return "\n".join(fragment for _, fragment in items)
+
+          def build_nav(current):
+              current_parts = current.relative_to(stage).parts
+              home = os.path.relpath(stage / "index.html", start=current.parent)
+              home_href = quote(home.replace(os.sep, "/"), safe="/")
+              return (
+                  '<nav class="docs-nav" aria-label="Documentation navigation">\n'
+                  '<div class="docs-nav-heading">'
+                  f'<a href="{home_href}">Documentation</a>'
+                  "</div>\n"
+                  f'<ul class="nav-list">\n'
+                  f'{render(tree, (), current, current_parts, top=True)}\n'
+                  "</ul>\n"
+                  "</nav>\n"
+              )
+
+          injected = 0
+          for page in pages:
               html = page.read_text(encoding="utf-8")
               lowered = html.lower()
               head_close = lowered.find("</head>")
@@ -517,10 +603,19 @@ jobs:
               else:
                   html = style_block + html
 
+              # The sidebar has to live in <body>, so find that tag in the
+              # (already modified) document and insert the tree right after it.
+              body_match = re.search(r"<body\b[^>]*>", html, flags=re.IGNORECASE)
+              if body_match:
+                  insert_at = body_match.end()
+                  html = html[:insert_at] + "\n" + build_nav(page) + html[insert_at:]
+              else:
+                  html += "\n" + build_nav(page)
+
               page.write_text(html, encoding="utf-8")
               injected += 1
 
-          print(f"::notice::Injected custom CSS into {injected} page(s).")
+          print(f"::notice::Injected custom CSS and navigation into {injected} page(s).")
           PY
 
       - name: Encrypt every page with StatiCrypt
