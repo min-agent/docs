@@ -4,8 +4,8 @@
 # StatiCrypt, commits the result, and publishes docs/ to GitHub Pages.
 #
 # The min_logo.png asset at the repository root is copied into the site,
-# shown in the navigation heading and password prompt of every generated
-# page, and used as the favicon of both the prompt and the decrypted page.
+# shown in the password prompt of every generated page, and used as the
+# favicon of both the prompt and the decrypted page.
 # StatiCrypt can only encrypt HTML, so the markdown index is published as
 # docs/index.html rather than docs/index.md.
 #
@@ -518,6 +518,19 @@ jobs:
           # rather than a separate clear-text file or the password template.
           style_block = f"<style>\n{css}\n</style>\n"
 
+          ribbon = (
+              '<header class="ribbon">\n'
+              '<nav aria-label="Site navigation">\n'
+              '<a href="https://min-agent.com">'
+              '<img src="https://min-agent.com/min_logo.png" alt="Min" /></a>\n'
+              '<div class="ribbon-links">\n'
+              '<a href="https://docs.min-agent.com">Docs</a>\n'
+              '<a href="https://github.com/min-agent">GitHub</a>\n'
+              '</div>\n'
+              '</nav>\n'
+              '</header>\n'
+          )
+
           pages = sorted(
               p for p in stage.rglob("*")
               if p.is_file() and p.suffix.lower() in {".html", ".htm"}
@@ -593,14 +606,10 @@ jobs:
               current_parts = current.relative_to(stage).parts
               home = os.path.relpath(stage / "index.html", start=current.parent)
               home_href = quote(home.replace(os.sep, "/"), safe="/")
-              logo = os.path.relpath(stage / "min_logo.png", start=current.parent)
-              logo_href = quote(logo.replace(os.sep, "/"), safe="/")
               return (
                   '<nav class="docs-nav" aria-label="Documentation navigation">\n'
                   '<div class="docs-nav-heading">\n'
-                  f'<a class="docs-nav-brand" href="{home_href}">'
-                  f'<img class="docs-nav-logo" src="{logo_href}" alt="" />'
-                  "<span>Documentation</span></a>\n"
+                  f'<a href="{home_href}">Documentation</a>\n'
                   "</div>\n"
                   f'<ul class="nav-list">\n'
                   f'{render(tree, (), current, current_parts, top=True)}\n'
@@ -626,14 +635,14 @@ jobs:
               else:
                   page_html = head_block + page_html
 
-              # The sidebar has to live in <body>, so find that tag in the
-              # (already modified) document and insert the tree right after it.
+              # Insert the ribbon and sidebar before the page content.
+              navigation = ribbon + build_nav(page)
               body_match = re.search(r"<body\b[^>]*>", page_html, flags=re.IGNORECASE)
               if body_match:
                   insert_at = body_match.end()
-                  page_html = page_html[:insert_at] + "\n" + build_nav(page) + page_html[insert_at:]
+                  page_html = page_html[:insert_at] + "\n" + navigation + page_html[insert_at:]
               else:
-                  page_html += "\n" + build_nav(page)
+                  page_html += "\n" + navigation
 
               page.write_text(page_html, encoding="utf-8")
               injected += 1

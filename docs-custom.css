@@ -9,15 +9,14 @@
  *
  * Keep this file outside docs/ so it is never published as a clear-text asset.
  *
- * The navigation sidebar is markup injected by that same build step. It is a
+ * The site ribbon and navigation sidebar are injected by that same build step.
+ * The sidebar is a
  * tree of <details class="nav-section"> elements, one per directory, with
  * <a class="nav-link"> entries for the pages in each directory. The build step
  * puts the `open` attribute only on the sections that lead to the page being
  * generated, so everything except the path to the current file is collapsed
  * by default. The `aria-current="page"` attribute marks the current page.
  * No JavaScript is involved: <details>/<summary> provide the collapsing.
- * The heading link also contains the min_logo.png image, which the build
- * copies to the root of the published site.
  */
 
 /* Load the pinned families so font-family resolves on systems without them. */
@@ -26,6 +25,8 @@
 :root {
   /* The body reserves this much room for the fixed navigation rail. */
   --docs-nav-width: 19rem;
+  --docs-content-start: calc(var(--docs-nav-width) + 2.5rem);
+  --docs-content-end: 2.5rem;
   --docs-bg: #0C0C0C;
   --docs-panel: #141414;
   --docs-border: #2A2A2A;
@@ -33,19 +34,27 @@
   --docs-muted: #9A9A9A;
   --docs-accent: #5AB0F4;
   --docs-active-bg: #143954;
+  --ribbon-panel: #1C1C1C;
+  --ribbon-separator: #5F5F5F;
+  --ribbon-accent: #0178D4;
+  --ribbon-link-padding: 0.4rem;
+  --ribbon-link-height: 2.25rem;
+  --ribbon-block-padding: 0.4rem;
+  --ribbon-height: calc(var(--ribbon-link-height) + 2 * var(--ribbon-block-padding) + 1px);
 }
 
 html {
   /* The root background fills the viewport outside the centered body column. */
   background-color: var(--docs-bg);
   scroll-behavior: smooth;
+  scroll-padding-block-start: var(--ribbon-height);
 }
 
 body {
   max-width: 88ch;
-  /* Leave space for the sidebar, with a comfortable gap on the content side. */
-  margin-left: calc(var(--docs-nav-width) + 1.5rem);
-  margin-right: 1.5rem;
+  /* Align the ribbon links with the text inside the body's padding. */
+  margin-block-start: var(--ribbon-height);
+  margin-inline: calc(var(--docs-content-start) - 1rem) calc(var(--docs-content-end) - 1rem);
   padding-inline: 1rem;
   line-height: 1.6;
 
@@ -68,13 +77,94 @@ a:active {
   color: #0178D4;
 }
 
+/* Site ribbon, matching the landing page and the Min GUI palette. */
+.ribbon {
+  position: fixed;
+  inset: 0 0 auto;
+  z-index: 21;
+  margin: 0;
+  background-color: var(--ribbon-panel);
+  border-bottom: 1px solid var(--ribbon-separator);
+  font-size: 1rem;
+  line-height: 1.35;
+  text-align: start;
+}
+
+.ribbon nav {
+  display: grid;
+  grid-template-columns: var(--docs-content-start) minmax(0, 88ch);
+  align-items: center;
+  padding-block: var(--ribbon-block-padding);
+  padding-inline-end: var(--docs-content-end);
+}
+
+.ribbon nav > a {
+  justify-self: start;
+  margin-inline-start: 0.65rem;
+}
+
+.ribbon-links {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.ribbon a {
+  display: flex;
+  align-items: center;
+  min-height: var(--ribbon-link-height);
+  padding-inline: var(--ribbon-link-padding);
+  border-radius: 0.25rem;
+  color: var(--docs-text);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.ribbon a:hover {
+  background-color: var(--ribbon-separator);
+  color: #C0C0C0;
+}
+
+/* Let the hover background extend past the column without moving Docs. */
+.ribbon-links a:first-child {
+  position: relative;
+  isolation: isolate;
+  padding-inline-start: 0;
+}
+
+.ribbon-links a:first-child:hover {
+  background-color: transparent;
+}
+
+.ribbon-links a:first-child:hover::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  inset-inline-start: calc(-1 * var(--ribbon-link-padding));
+  z-index: -1;
+  border-radius: inherit;
+  background-color: var(--ribbon-separator);
+  pointer-events: none;
+}
+
+.ribbon a:focus-visible {
+  outline: 2px solid var(--ribbon-accent);
+  outline-offset: -2px;
+}
+
+.ribbon img {
+  display: block;
+  width: 2rem;
+  height: 2rem;
+  object-fit: contain;
+}
+
 /* ------------------------------------------------------------------------- *
  * Navigation sidebar
  * ------------------------------------------------------------------------- */
 
 .docs-nav {
   position: fixed;
-  inset-block: 0;
+  inset-block: var(--ribbon-height) 0;
   inset-inline-start: 0;
   z-index: 20;
   box-sizing: border-box;
@@ -176,19 +266,6 @@ a:active {
   color: #FFFFFF;
 }
 
-.docs-nav .docs-nav-brand {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-.docs-nav-logo {
-  width: 2rem;
-  height: 2rem;
-  flex: 0 0 auto;
-  object-fit: contain;
-}
-
 .docs-nav a.nav-link {
   display: block;
   padding: 0.2rem 0.4rem 0.2rem 1.05rem;
@@ -216,6 +293,11 @@ a:active {
 
 /* On narrow screens the rail becomes a scrollable header above the content. */
 @media (max-width: 60rem) {
+  :root {
+    --docs-content-start: 4rem;
+    --docs-content-end: 2rem;
+  }
+
   .docs-nav {
     position: static;
     inset: auto;
@@ -224,13 +306,10 @@ a:active {
     border-right: 0;
     border-bottom: 1px solid var(--docs-border);
   }
-  body {
-    margin-left: 1rem;
-    margin-right: 1rem;
-  }
 }
 
 @media print {
+  .ribbon,
   .docs-nav {
     display: none;
   }
