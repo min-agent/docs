@@ -61,7 +61,7 @@ jobs:
     timeout-minutes: 45
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page_url || steps.deployment-retry.outputs.page_url }}
     env:
       CODE_REPO: min-agent/Min
       SYNC_TOKEN: ${{ secrets.DOCS_BOT_TOKEN }}
@@ -827,6 +827,8 @@ jobs:
               -f "name=$PAGES_ARTIFACT_NAME" \
               --jq '.artifacts[] | select(.expired == false) | .id') &&
               [[ -n "$PAGES_ARTIFACT_ID" && "$listed_id" == "$PAGES_ARTIFACT_ID" ]]; then
+              # The Pages action uses a different listing service that can lag behind REST.
+              sleep 15
               exit 0
             fi
             if [[ "$attempt" != 12 ]]; then
@@ -838,6 +840,19 @@ jobs:
 
       - name: Deploy to GitHub Pages
         id: deployment
+        continue-on-error: true
+        uses: actions/deploy-pages@v5
+        with:
+          artifact_name: ${{ env.PAGES_ARTIFACT_NAME }}
+
+      - name: Wait before retrying the Pages deployment
+        if: steps.deployment.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+
+      - name: Retry deployment to GitHub Pages
+        if: steps.deployment.outcome == 'failure'
+        id: deployment-retry
         uses: actions/deploy-pages@v5
         with:
           artifact_name: ${{ env.PAGES_ARTIFACT_NAME }}
