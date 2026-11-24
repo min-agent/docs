@@ -48,6 +48,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: write
   pages: write
   id-token: write
@@ -69,6 +70,7 @@ jobs:
       PANDOC_VERSION: "3.14"
       PANDOC_SHA256: "c5f4720cdefb3f7bdc5d07202ef579feef0d1370773c873804dd8fdaa8c4f1b8"
       STATICRYPT_VERSION: "3.5.4"
+      PAGES_ARTIFACT_NAME: github-pages-${{ github.run_attempt }}
 
     steps:
       - name: Check required configuration
@@ -804,10 +806,38 @@ jobs:
       - name: Setup Pages
         uses: actions/configure-pages@v5
       - name: Upload artifact
+        id: pages-artifact
         uses: actions/upload-pages-artifact@v3
         with:
+          # A rerun can still see artifacts uploaded by earlier attempts.
+          name: ${{ env.PAGES_ARTIFACT_NAME }}
           # Upload only the docs directory so it becomes the site root
           path: './docs'
+
+      - name: Wait for the Pages artifact to be listed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAGES_ARTIFACT_ID: ${{ steps.pages-artifact.outputs.artifact_id }}
+        run: |
+          set -euo pipefail
+          for attempt in {1..12}; do
+            if listed_id=$(gh api --method GET \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+              -f "name=$PAGES_ARTIFACT_NAME" \
+              --jq '.artifacts[] | select(.expired == false) | .id') &&
+              [[ -n "$PAGES_ARTIFACT_ID" && "$listed_id" == "$PAGES_ARTIFACT_ID" ]]; then
+              exit 0
+            fi
+            if [[ "$attempt" != 12 ]]; then
+              sleep 5
+            fi
+          done
+          echo "::error::Pages artifact '$PAGES_ARTIFACT_NAME' (ID $PAGES_ARTIFACT_ID) was not listed after upload."
+          exit 1
+
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
+        with:
+          artifact_name: ${{ env.PAGES_ARTIFACT_NAME }}
